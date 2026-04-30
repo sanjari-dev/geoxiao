@@ -6,7 +6,7 @@ import asyncio
 from collections import deque
 from datetime import date
 import asyncpg
-from src.config.settings import settings
+from src.data.repositories.base import postgres_asyncpg_dsn
 import structlog
 
 log = structlog.get_logger(__name__)
@@ -46,7 +46,7 @@ class AsyncTradeLogSync:
     async def start(self) -> None:
         """Buat connection pool dan mulai periodic flush task."""
         self._pool = await asyncpg.create_pool(
-            dsn=settings.PG_DSN_SYNC,  # Gunakan non-asyncpg DSN untuk asyncpg
+            dsn=postgres_asyncpg_dsn(),
             min_size=2,
             max_size=10,
         )
