@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "geoxiao"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "nautilus_trader>=1.200.0",
+    "deap>=1.4.1",
+    "optuna>=3.6.0",
+    "polars>=0.20.0",
+    "connectorx>=0.3.2",
+    "ray[default]>=2.10.0",
+    "clickhouse-connect>=0.7.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "asyncpg>=0.29.0",
+    "psycopg[binary]>=3.1.0",
+    "alembic>=1.13.0",
+    "pydantic-settings>=2.2.0",
+    "structlog>=24.1.0",
+    "tenacity>=8.2.0",
+    "streamlit>=1.32.0",
+]
+
+[project.optional-dependencies]
+gpu = ["cudf-cu12", "cupy-cuda12x"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-mock>=3.12"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]

@@ -1,1 +1,28 @@
-.idea
+# IDE
+.idea/
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+
+# Runtime artifacts
+logs/
+*.log
+streamlit_dashboard.*.log
+checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
