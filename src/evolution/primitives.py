@@ -71,8 +71,10 @@ def order_book_imbalance(bid_size: Arr, ask_size: Arr, window: int = 20) -> floa
         float scalar OBI saat ini
     """
     w = min(window, len(bid_size))
-    total_bid = np.sum(bid_size[-w:])
-    total_ask = np.sum(ask_size[-w:])
+    # Cast before summing because ClickHouse volumes arrive as UInt32.  Keeping
+    # the unsigned dtype can overflow on total_bid - total_ask.
+    total_bid = float(np.sum(bid_size[-w:].astype(np.float64)))
+    total_ask = float(np.sum(ask_size[-w:].astype(np.float64)))
     total = total_bid + total_ask
     return float((total_bid - total_ask) / total) if total > 0 else 0.0
 

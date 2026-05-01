@@ -53,18 +53,19 @@ class ClickHouseNautilusAdapter:
         Query tick data dari ClickHouse secara READ-ONLY.
         Disesuaikan dengan skema tabel `ticks` milik sistem ingestion eksternal.
         """
-        # Menggunakan ALIAS agar nama kolom sesuai dengan ekspektasi Geoxiao
+        # Menggunakan ALIAS agar nama kolom sesuai dengan ekspektasi Geoxiao.
+        # Tabel ingestion saat ini memakai kolom timestamp (bukan time).
         query = f"""
             SELECT 
-                time AS timestamp, 
+                timestamp, 
                 bid, 
                 ask, 
                 bid_volume AS bid_size, 
                 ask_volume AS ask_size
             FROM ticks
             WHERE instrument = '{symbol}'
-              AND time BETWEEN '{start}' AND '{end}'
-            ORDER BY time ASC
+              AND timestamp BETWEEN '{start}' AND '{end}'
+            ORDER BY timestamp ASC
         """
         log.info('Fetching tick data (READ-ONLY)', symbol=symbol, start=start, end=end)
 

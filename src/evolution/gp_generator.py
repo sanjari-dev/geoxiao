@@ -14,6 +14,7 @@ from deap import base, creator, gp, tools, algorithms
 
 from src.evolution.base import BaseGenerator
 from src.strategy.base_strategy import StrategyDNA, BaseStrategy
+from src.config.settings import settings
 from src.evolution.primitives import (
     safe_div, safe_log, safe_sqrt, neg, square, cube, sigmoid, sign_fn,
     max2, min2, order_book_imbalance, tick_velocity, spread_dynamics,
@@ -95,13 +96,13 @@ class DEAPGenerator(BaseGenerator):
     MAX_TREE_DEPTH = 6
     TOURNAMENT_SIZE = 3
 
-    def __init__(self, symbol: str = 'EURUSD', timeframe: str = 'M15') -> None:
-        self.symbol = symbol
-        self.timeframe = timeframe
+    def __init__(self, symbol: str | None = None, timeframe: str | None = None) -> None:
+        self.symbol = symbol or settings.SYMBOL
+        self.timeframe = timeframe or settings.TIMEFRAME
         self.pset = _build_primitive_set()
         self.toolbox = self._build_toolbox()
         self.GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-        log.info('DEAPGenerator initialized', symbol=symbol, timeframe=timeframe)
+        log.info('DEAPGenerator initialized', symbol=self.symbol, timeframe=self.timeframe)
 
     def _build_toolbox(self) -> base.Toolbox:
         """Register semua operator DEAP ke toolbox."""
