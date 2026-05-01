@@ -15,6 +15,7 @@ from src.backtest.backtest_runner import RayBacktestRunner
 from src.evolution.fitness import HardConstraintEvaluator, FitnessScorer
 from src.evolution.persistence import CheckpointManager, EvolutionCheckpoint
 from src.analytics.metrics_calculator import MetricsCalculator
+from src.data.schema_bootstrap import ensure_postgres_schema
 
 # Jika logger belum didefinisikan secara penuh di src/config/logging.py, kita setup sederhana
 try:
@@ -61,6 +62,7 @@ async def run_evolution(
     p_size = pop_size or settings.POP_SIZE
 
     log.info('Evolution starting', run_id=run_id, n_generations=n_gen, pop_size=p_size)
+    ensure_postgres_schema()
 
     # ── Inisialisasi komponen ─────────────────────────────────────────
     checkpoint_mgr = CheckpointManager(run_id)
@@ -213,6 +215,7 @@ if __name__ == '__main__':
     parser.add_argument('--pop-size', type=int, default=None)
     args = parser.parse_args()
 
+    ensure_postgres_schema()
     ray.init(address=settings.RAY_ADDRESS or 'auto', ignore_reinit_error=True)
     log.info('Ray initialized', address=settings.RAY_ADDRESS or 'auto')
 

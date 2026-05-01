@@ -20,14 +20,19 @@ class Settings(BaseSettings):
     PG_DSN_SYNC: str = 'postgresql://geoxiao:secret@localhost:5432/geoxiao'
 
     # Optuna
-    OPTUNA_STORAGE: str = 'postgresql://geoxiao:secret@localhost:5432/geoxiao'
+    OPTUNA_STORAGE: str = 'postgresql+psycopg://geoxiao:secret@localhost:5432/geoxiao'
 
     # Ray
     RAY_ADDRESS: str | None = None
 
     # Evolution
+    SYMBOL: str = 'AUDUSD'
+    TIMEFRAME: str = 'H1'
     N_GENERATIONS: int = 100
     POP_SIZE: int = 50
+    OPTUNA_N_TRIALS: int = 30
+    BACKTEST_START: str = '2023-07-01'
+    BACKTEST_END: str = '2023-12-31'
 
     # Analytics
     USE_GPU: bool = False

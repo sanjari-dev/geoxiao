@@ -8,7 +8,7 @@ log = structlog.get_logger(__name__)
 
 def verify_clickhouse_data():
     parser = argparse.ArgumentParser(description='Geoxiao Read-Only Data Verifier')
-    parser.add_argument('--symbol', type=str, default='EURUSD')
+    parser.add_argument('--symbol', type=str, default=settings.SYMBOL)
     args = parser.parse_args()
 
     try:
@@ -22,8 +22,8 @@ def verify_clickhouse_data():
         
         query = f"""
             SELECT 
-                min(time) as first_tick,
-                max(time) as last_tick,
+                min(timestamp) as first_tick,
+                max(timestamp) as last_tick,
                 count(*) as total_rows
             FROM ticks
             WHERE instrument = '{args.symbol}'

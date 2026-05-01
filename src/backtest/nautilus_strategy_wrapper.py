@@ -4,6 +4,7 @@
 from __future__ import annotations
 import polars as pl
 from collections import deque
+from datetime import timedelta
 
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.config import StrategyConfig
@@ -114,7 +115,7 @@ class NautilusStrategyAdapter(Strategy):
             quantity=instrument.make_qty(100_000),  # 1 lot standard
             price=instrument.make_price(price),
             time_in_force=TimeInForce.GTD,
-            expire_time_ns=tick.ts_event + int(3600 * 1e9),  # GTD 1 jam
+            expire_time=self.clock.utc_now() + timedelta(hours=1),  # GTD 1 jam
         )
         self.submit_order(order)
         self._position_open = True

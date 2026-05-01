@@ -93,17 +93,19 @@ def _backtest_one_remote(
             )
         )
 
-        # Instrumen dan akun
-        instrument = TestInstrumentProvider.default_fx_ccy(dna.symbol)
-        engine.add_instrument(instrument)
-        engine.add_data(quote_ticks)
-
-        engine.add_account(
+        # Venue + akun harus didaftarkan sebelum instrumen pada NautilusTrader.
+        engine.add_venue(
+            venue=Venue('SIM'),
+            oms_type=OmsType.HEDGING,
             account_type=AccountType.MARGIN,
             base_currency=USD,
             starting_balances=[Money(100_000, USD)],
-            oms_type=OmsType.HEDGING,
         )
+
+        # Instrumen dan market data
+        instrument = TestInstrumentProvider.default_fx_ccy(dna.symbol)
+        engine.add_instrument(instrument)
+        engine.add_data(quote_ticks)
 
         # ── 5. Register strategy sebagai NautilusTrader strategy actor ─
         # NautilusTrader menggunakan internal actor system.
@@ -226,7 +228,7 @@ class RayBacktestRunner:
         self,
         backtest_start: str | None = None,
         backtest_end: str | None = None,
-        optuna_n_trials: int = 30,
+        optuna_n_trials: int | None = None,
     ) -> None:
         from src.evolution.optuna_tuner import OptunaTuner
         from src.analytics.metrics_calculator import MetricsCalculator
@@ -236,9 +238,9 @@ class RayBacktestRunner:
         from src.backtest.nautilus_adapter import ClickHouseNautilusAdapter
         from src.config.settings import settings
 
-        self.backtest_start = backtest_start or self.DEFAULT_START
-        self.backtest_end = backtest_end or self.DEFAULT_END
-        self.optuna_n_trials = optuna_n_trials
+        self.backtest_start = backtest_start or settings.BACKTEST_START or self.DEFAULT_START
+        self.backtest_end = backtest_end or settings.BACKTEST_END or self.DEFAULT_END
+        self.optuna_n_trials = optuna_n_trials or settings.OPTUNA_N_TRIALS
 
         # Komponen — diinisialisasi sekali, digunakan untuk semua individu
         self.metrics_calc = MetricsCalculator()
