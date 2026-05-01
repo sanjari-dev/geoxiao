@@ -15,6 +15,7 @@ from src.backtest.backtest_runner import RayBacktestRunner
 from src.evolution.fitness import HardConstraintEvaluator, FitnessScorer
 from src.evolution.persistence import CheckpointManager, EvolutionCheckpoint
 from src.analytics.metrics_calculator import MetricsCalculator
+from src.data.schema_bootstrap import ensure_postgres_schema
 
 # Jika logger belum didefinisikan secara penuh di src/config/logging.py, kita setup sederhana
 try:
@@ -61,6 +62,7 @@ async def run_evolution(
     p_size = pop_size or settings.POP_SIZE
 
     log.info('Evolution starting', run_id=run_id, n_generations=n_gen, pop_size=p_size)
+    ensure_postgres_schema()
 
     # ── Inisialisasi komponen ─────────────────────────────────────────
     checkpoint_mgr = CheckpointManager(run_id)
@@ -112,15 +114,50 @@ async def run_evolution(
         survivors = []
         for dna, monthly_metrics in eval_results:
             constraint_result = constraint_eval.evaluate(monthly_metrics)
+            trial_id = (
+                str(monthly_metrics['trial_id'][0])
+                if 'trial_id' in monthly_metrics.columns and not monthly_metrics.is_empty()
+                else None
+            )
+            summary = metrics_calc.get_summary_stats(monthly_metrics)
+            total_pips = (
+                float(monthly_metrics['net_pips'].sum())
+                if 'net_pips' in monthly_metrics.columns
+                else None
+            )
+            trade_count = (
+                int(monthly_metrics['trade_count'].sum())
+                if 'trade_count' in monthly_metrics.columns
+                else None
+            )
+
             if constraint_result['passed']:
                 score = fitness_scorer.compute(monthly_metrics)
                 dna.fitness_score = score
                 dna.status = 'passed'
+                dna.eliminated_reason = None
                 survivors.append(dna)
                 total_passed += 1
             else:
                 dna.status = 'eliminated'
                 dna.eliminated_reason = ' | '.join(constraint_result['flags'])
+
+            if trial_id:
+                metrics_calc.update_constraint_result(
+                    trial_id,
+                    passed=constraint_result['passed'],
+                    flags=constraint_result.get('flags', []),
+                )
+                await backtest_runner.trial_repo.update_results(
+                    trial_id,
+                    profit_factor=summary.get('avg_profit_factor'),
+                    total_pips=total_pips,
+                    max_drawdown_pips=summary.get('max_drawdown'),
+                    trade_count=trade_count,
+                    fitness_score=dna.fitness_score if constraint_result['passed'] else None,
+                    eliminated_reason=dna.eliminated_reason,
+                )
+            await backtest_runner.strategy_repo.update_status(dna.id, dna.status)
 
         log.info('Generation evaluated',
                  gen=gen,
@@ -178,6 +215,7 @@ if __name__ == '__main__':
     parser.add_argument('--pop-size', type=int, default=None)
     args = parser.parse_args()
 
+    ensure_postgres_schema()
     ray.init(address=settings.RAY_ADDRESS or 'auto', ignore_reinit_error=True)
     log.info('Ray initialized', address=settings.RAY_ADDRESS or 'auto')
 

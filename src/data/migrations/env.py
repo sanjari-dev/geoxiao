@@ -2,11 +2,11 @@
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
-from src.config.settings import settings
+from src.data.repositories.base import postgres_sync_dsn
 
 config = context.config
 # Gunakan DSN sinkron (non-asyncpg) untuk keperluan migrasi Alembic
-config.set_main_option('sqlalchemy.url', settings.PG_DSN_SYNC)
+config.set_main_option('sqlalchemy.url', postgres_sync_dsn())
 
 def run_migrations_online():
     connectable = engine_from_config(

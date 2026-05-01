@@ -3,7 +3,7 @@ import streamlit as st
 import connectorx as cx
 import polars as pl
 import pandas as pd
-from src.config.settings import settings
+from src.data.repositories.base import postgres_sync_dsn
 
 st.set_page_config(page_title="Geoxiao Evolution Monitor", layout="wide")
 
@@ -24,8 +24,9 @@ def fetch_data():
         query_dna = "SELECT * FROM strategy_dna ORDER BY created_at DESC"
         query_trials = "SELECT * FROM trial_logs ORDER BY created_at DESC"
         
-        df_dna = cx.read_sql(settings.PG_DSN_SYNC, query_dna, return_type='pandas')
-        df_trials = cx.read_sql(settings.PG_DSN_SYNC, query_trials, return_type='pandas')
+        dsn = postgres_sync_dsn()
+        df_dna = cx.read_sql(dsn, query_dna, return_type='pandas')
+        df_trials = cx.read_sql(dsn, query_trials, return_type='pandas')
         return df_dna, df_trials
     except Exception as e:
         st.error(f"Database connection error: {e}")

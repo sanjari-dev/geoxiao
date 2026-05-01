@@ -22,6 +22,7 @@ logs/
 *.log
 streamlit_dashboard.*.log
 checkpoints/
+src/strategy/generated/Strategy_*.py
 
 # OS
 .DS_Store

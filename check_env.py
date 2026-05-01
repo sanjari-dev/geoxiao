@@ -348,6 +348,35 @@ async def ping_postgres(env: dict[str, str], state: CheckState) -> None:
             state.ok("PostgreSQL SELECT 1 succeeded.")
         else:
             state.fail(f"PostgreSQL ping returned unexpected value: {value!r}")
+            return
+
+        required_tables = {"strategy_dna", "trial_logs", "trade_logs", "monthly_metrics"}
+        rows = await asyncio.wait_for(
+            conn.fetch(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = ANY($1::text[])
+                """,
+                list(required_tables),
+            ),
+            timeout=DB_CONNECT_TIMEOUT_SECONDS,
+        )
+        existing = {row["table_name"] for row in rows}
+        missing = required_tables - existing
+        if not missing:
+            state.ok("PostgreSQL Geoxiao runtime tables are present.")
+        elif not existing:
+            state.warn(
+                "PostgreSQL Geoxiao runtime tables are missing; "
+                "run_evolution.py will auto-create them on first startup."
+            )
+        else:
+            state.fail(
+                "PostgreSQL Geoxiao schema is partial; repair migrations manually. "
+                f"Missing tables: {', '.join(sorted(missing))}"
+            )
     except Exception as exc:
         state.fail(f"PostgreSQL connection/ping failed: {type(exc).__name__}: {exc}")
     finally:
