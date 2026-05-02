@@ -239,32 +239,50 @@ async def run_evolution(
         for dna in tuned_population:
             await strategy_repo.save(dna)
 
-        ray_futures = []
-        for dna in tuned_population:
-            trial_id = str(uuid.uuid4())
-            await trial_repo.save({
-                'id': trial_id,
-                'strategy_id': dna.id,
-                'optuna_trial_id': -1,
-                'study_name': f'gen{gen}_{dna.id[:8]}',
-                'params_json': dna.params,
-            })
-            ray_futures.append(
-                _evaluate_dna_clickhouse_remote.remote(
-                    vars(dna).copy(),
-                    trial_id,
+        eval_results = []
+        eval_concurrency = max(1, settings.CLICKHOUSE_EVAL_CONCURRENCY)
+        for batch_start in range(0, len(tuned_population), eval_concurrency):
+            if STOP_FLAG:
+                log.warning(
+                    'STOP_FLAG set — stop dispatching ClickHouse evaluation batches',
+                    generation=gen,
+                    evaluated=len(eval_results),
+                    total=len(tuned_population),
                 )
+                break
+
+            batch = tuned_population[batch_start:batch_start + eval_concurrency]
+            ray_futures = []
+            for dna in batch:
+                trial_id = str(uuid.uuid4())
+                await trial_repo.save({
+                    'id': trial_id,
+                    'strategy_id': dna.id,
+                    'optuna_trial_id': -1,
+                    'study_name': f'gen{gen}_{dna.id[:8]}',
+                    'params_json': dna.params,
+                })
+                ray_futures.append(
+                    _evaluate_dna_clickhouse_remote.remote(
+                        vars(dna).copy(),
+                        trial_id,
+                    )
+                )
+
+            log.info(
+                'ClickHouse Ray task batch dispatched',
+                generation=gen,
+                batch_start=batch_start,
+                batch_size=len(ray_futures),
+                concurrency=eval_concurrency,
             )
 
-        log.info('ClickHouse Ray tasks dispatched', generation=gen, count=len(ray_futures))
-
-        raw_results = ray.get(ray_futures, timeout=3600) if ray_futures else []
-        eval_results = []
-        for result in raw_results:
-            if result is None:
-                continue
-            dna_dict, monthly_metrics = result
-            eval_results.append((generator.dna_from_dict(dna_dict), monthly_metrics))
+            raw_results = ray.get(ray_futures, timeout=3600) if ray_futures else []
+            for result in raw_results:
+                if result is None:
+                    continue
+                dna_dict, monthly_metrics = result
+                eval_results.append((generator.dna_from_dict(dna_dict), monthly_metrics))
 
         total_evaluated += len(eval_results)
 

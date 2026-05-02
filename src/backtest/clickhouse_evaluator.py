@@ -12,7 +12,7 @@ import ast
 import math
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import clickhouse_connect
@@ -110,23 +110,33 @@ class ClickHouseEvaluator:
     }
 
     DEFAULT_BLOCK_SIZE = 10_000
-    DEFAULT_MAX_HOLDING_SECONDS = 86_400
+    DEFAULT_MAX_HOLDING_SECONDS = 3_600
     DEFAULT_ENTRY_COOLDOWN_SECONDS = 60
+    DEFAULT_BACKTEST_CHUNK_DAYS = 7
+    DEFAULT_FEATURE_WARMUP_SECONDS = 3_600
 
     def __init__(
         self,
         *,
         database: str | None = None,
         ticks_table: str = "ticks",
-        block_size: int = DEFAULT_BLOCK_SIZE,
-        max_holding_seconds: int = DEFAULT_MAX_HOLDING_SECONDS,
-        entry_cooldown_seconds: int = DEFAULT_ENTRY_COOLDOWN_SECONDS,
+        block_size: int | None = None,
+        max_holding_seconds: int | None = None,
+        entry_cooldown_seconds: int | None = None,
+        chunk_days: int | None = None,
+        feature_warmup_seconds: int | None = None,
     ) -> None:
         self.database = database or settings.CH_DATABASE
         self.ticks_table = ticks_table
-        self.block_size = block_size
-        self.max_holding_seconds = max_holding_seconds
-        self.entry_cooldown_seconds = entry_cooldown_seconds
+        self.block_size = block_size or settings.CLICKHOUSE_BLOCK_SIZE
+        self.max_holding_seconds = max_holding_seconds or settings.CLICKHOUSE_MAX_HOLDING_SECONDS
+        self.entry_cooldown_seconds = entry_cooldown_seconds or settings.CLICKHOUSE_ENTRY_COOLDOWN_SECONDS
+        self.chunk_days = chunk_days if chunk_days is not None else settings.CLICKHOUSE_BACKTEST_CHUNK_DAYS
+        self.feature_warmup_seconds = (
+            feature_warmup_seconds
+            if feature_warmup_seconds is not None
+            else settings.CLICKHOUSE_FEATURE_WARMUP_SECONDS
+        )
         self.client = clickhouse_connect.get_client(
             host=settings.CH_HOST,
             port=settings.CH_PORT,
@@ -167,7 +177,6 @@ class ClickHouseEvaluator:
             Incremental aggregate metrics computed while streaming rows.
         """
 
-        query = self._build_query(dna)
         metrics = RunningBacktestMetrics()
         trade_id = trial_id or str(uuid.uuid4())
 
@@ -176,31 +185,103 @@ class ClickHouseEvaluator:
             strategy_id=dna.id,
             symbol=dna.symbol,
             block_size=self.block_size,
+            chunk_days=self.chunk_days,
+            max_holding_seconds=self.max_holding_seconds,
         )
 
-        with self.client.query_row_block_stream(
-            query,
-            settings={
-                "max_block_size": self.block_size,
-                # Required by some ClickHouse versions for JOIN predicates that
-                # include a timestamp range in addition to the equality key.
-                "allow_experimental_join_condition": 1,
-            },
-        ) as stream:
-            for block in stream:
-                batch = self._process_block(block, dna=dna, trial_id=trade_id, metrics=metrics)
-                if persist_trade_sink is not None and batch:
-                    self._flush_batch_to_sink(persist_trade_sink, batch)
-                del batch
+        for query in self._iter_backtest_queries(dna):
+            self._stream_query(
+                query,
+                dna=dna,
+                trial_id=trade_id,
+                metrics=metrics,
+                persist_trade_sink=persist_trade_sink,
+            )
 
         result = metrics.as_dict()
         result["trial_id"] = trade_id
         log.info("ClickHouse streaming backtest complete", strategy_id=dna.id, **result)
         return result
 
+    def _stream_query(
+        self,
+        query: str,
+        *,
+        dna: StrategyDNA,
+        trial_id: str,
+        metrics: RunningBacktestMetrics,
+        persist_trade_sink: Any | None,
+    ) -> None:
+        with self.client.query_row_block_stream(
+            query,
+            settings={
+                "max_block_size": self.block_size,
+                "max_threads": settings.CLICKHOUSE_QUERY_MAX_THREADS,
+                # Required by some ClickHouse versions for JOIN predicates that
+                # include a timestamp range in addition to the equality key.
+                "allow_experimental_join_condition": 1,
+            },
+        ) as stream:
+            for block in stream:
+                batch = self._process_block(block, dna=dna, trial_id=trial_id, metrics=metrics)
+                if persist_trade_sink is not None and batch:
+                    self._flush_batch_to_sink(persist_trade_sink, batch)
+                del batch
+
+    def _iter_backtest_queries(self, dna: StrategyDNA) -> Iterable[str]:
+        if self.chunk_days <= 0:
+            yield self._build_query(dna)
+            return
+
+        start, end = self._fetch_symbol_bounds(dna.symbol)
+        if start is None or end is None or start >= end:
+            return
+
+        chunk_delta = timedelta(days=self.chunk_days)
+        warmup_delta = timedelta(seconds=max(self.feature_warmup_seconds, self.entry_cooldown_seconds))
+        holding_delta = timedelta(seconds=self.max_holding_seconds)
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(chunk_start + chunk_delta, end + timedelta(microseconds=1))
+            scan_start = chunk_start - warmup_delta
+            scan_end = chunk_end + holding_delta
+            log.info(
+                "ClickHouse backtest chunk",
+                strategy_id=dna.id,
+                symbol=dna.symbol,
+                trade_start=chunk_start.isoformat(),
+                trade_end=chunk_end.isoformat(),
+            )
+            yield self._build_query(
+                dna,
+                trade_start=chunk_start,
+                trade_end=chunk_end,
+                scan_start=scan_start,
+                scan_end=scan_end,
+            )
+            chunk_start = chunk_end
+
+    def _fetch_symbol_bounds(self, symbol: str) -> tuple[datetime | None, datetime | None]:
+        query = f"""
+SELECT
+    min(timestamp) AS start_time,
+    max(timestamp) AS end_time
+FROM {self._quoted_table()}
+WHERE instrument = '{self._escape_literal(symbol)}'
+"""
+        row = self.client.query(query).first_row
+        if row is None or row[0] is None or row[1] is None:
+            return None, None
+        return self._ensure_datetime(row[0]), self._ensure_datetime(row[1])
+
     def _build_query(
         self,
         dna: StrategyDNA,
+        *,
+        trade_start: datetime | None = None,
+        trade_end: datetime | None = None,
+        scan_start: datetime | None = None,
+        scan_end: datetime | None = None,
     ) -> str:
         signal_sql = self._translate_dna_to_sql(dna)
         params = dna.params or {}
@@ -221,6 +302,22 @@ class ClickHouseEvaluator:
             "kurt": int(params.get("kurt_window", 30)),
             "vw_spread": int(params.get("vw_spread_window", 20)),
         }
+        tick_filters = [f"instrument = '{self._escape_literal(dna.symbol)}'"]
+        if scan_start is not None:
+            tick_filters.append(f"timestamp >= {self._datetime64_literal(scan_start)}")
+        if scan_end is not None:
+            tick_filters.append(f"timestamp < {self._datetime64_literal(scan_end)}")
+        tick_where = "\n      AND ".join(tick_filters)
+        entry_filters: list[str] = []
+        if trade_start is not None:
+            entry_filters.append(f"entry_time >= {self._datetime64_literal(trade_start)}")
+        if trade_end is not None:
+            entry_filters.append(f"entry_time < {self._datetime64_literal(trade_end)}")
+        entry_where = (
+            "WHERE " + "\n      AND ".join(entry_filters)
+            if entry_filters
+            else ""
+        )
 
         return f"""
 WITH
@@ -238,11 +335,11 @@ base_ticks AS (
         toFloat64(ask) AS ask,
         toFloat64(bid_volume) AS bid_size,
         toFloat64(ask_volume) AS ask_size,
-        (toFloat64(bid) + toFloat64(ask)) / 2.0 AS mid,
-        toFloat64(ask) - toFloat64(bid) AS spread
-    FROM {self._quoted_table()}
-    WHERE instrument = '{self._escape_literal(dna.symbol)}'
-),
+	        (toFloat64(bid) + toFloat64(ask)) / 2.0 AS mid,
+	        toFloat64(ask) - toFloat64(bid) AS spread
+	    FROM {self._quoted_table()}
+	    WHERE {tick_where}
+	),
 ordered_ticks AS (
     SELECT
         *,
@@ -364,12 +461,17 @@ entry_candidates AS (
         ) AS previous_entry_time
     FROM entries
 ),
-filtered_entries AS (
-    SELECT *
-    FROM entry_candidates
-    WHERE dateDiff('second', previous_entry_time, entry_time) >= entry_cooldown_seconds
-),
-exit_hits AS (
+	filtered_entries AS (
+	    SELECT *
+	    FROM entry_candidates
+	    WHERE dateDiff('second', previous_entry_time, entry_time) >= entry_cooldown_seconds
+	),
+	eligible_entries AS (
+	    SELECT *
+	    FROM filtered_entries
+	    {entry_where}
+	),
+	exit_hits AS (
     SELECT
         e.entry_time,
         e.side,
@@ -381,7 +483,7 @@ exit_hits AS (
             (e.side = 'BUY' AND (f.bid <= e.sl_price OR f.bid >= e.tp_price))
              OR (e.side = 'SELL' AND (f.ask >= e.sl_price OR f.ask <= e.tp_price))
         ) AS exit_time
-    FROM filtered_entries AS e
+	    FROM eligible_entries AS e
     INNER JOIN base_ticks AS f
         ON f.instrument = e.instrument
        AND f.timestamp > e.entry_time
@@ -503,6 +605,11 @@ ORDER BY entry_time ASC
     @staticmethod
     def _escape_literal(value: str) -> str:
         return value.replace("\\", "\\\\").replace("'", "\\'")
+
+    @classmethod
+    def _datetime64_literal(cls, value: datetime) -> str:
+        dt = cls._ensure_datetime(value).astimezone(timezone.utc)
+        return f"toDateTime64('{dt:%Y-%m-%d %H:%M:%S.%f}', 6, 'UTC')"
 
     @staticmethod
     def _ensure_datetime(value: Any) -> datetime:
