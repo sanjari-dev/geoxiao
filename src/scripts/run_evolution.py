@@ -11,10 +11,11 @@ from src.config.logging import configure_logging
 from src.config.settings import settings
 from src.evolution.gp_generator import DEAPGenerator
 from src.evolution.optuna_tuner import OptunaTuner
-from src.backtest.backtest_runner import RayBacktestRunner
 from src.evolution.fitness import HardConstraintEvaluator, FitnessScorer
 from src.evolution.persistence import CheckpointManager, EvolutionCheckpoint
 from src.analytics.metrics_calculator import MetricsCalculator
+from src.data.repositories.strategy_repo import StrategyRepository
+from src.data.repositories.trial_repo import TrialRepository
 from src.data.schema_bootstrap import ensure_postgres_schema
 
 # Jika logger belum didefinisikan secara penuh di src/config/logging.py, kita setup sederhana
@@ -36,6 +37,109 @@ def _handle_signal(sig, frame) -> None:
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
+
+
+@ray.remote
+def _evaluate_dna_clickhouse_remote(
+    dna_dict: dict,
+    trial_id: str,
+) -> tuple[dict, object] | None:
+    """
+    Ray worker for one ClickHouse vectorized backtest.
+
+    Deferred imports are intentional: Ray serializes this function to workers,
+    and importing the ClickHouse/PostgreSQL stack inside the worker keeps the
+    driver process free from worker-only runtime objects.
+    """
+
+    import asyncio
+    import traceback
+
+    import structlog
+
+    from src.analytics.metrics_calculator import MetricsCalculator
+    from src.backtest.clickhouse_evaluator import ClickHouseEvaluator
+    from src.data.repositories.trade_repo import TradeRepository
+    from src.strategy.base_strategy import StrategyDNA
+
+    worker_log = structlog.get_logger("clickhouse_eval_worker")
+    dna = StrategyDNA(
+        **{
+            k: v
+            for k, v in dna_dict.items()
+            if k in StrategyDNA.__dataclass_fields__
+        }
+    )
+    dna.params = dna_dict.get("params") or dna_dict.get("params_json") or {}
+
+    loop = asyncio.new_event_loop()
+    trade_repo = TradeRepository()
+
+    try:
+        asyncio.set_event_loop(loop)
+
+        def persist_trade_batch(batch: list[dict]) -> None:
+            loop.run_until_complete(trade_repo.batch_insert(batch))
+
+        evaluator = ClickHouseEvaluator()
+        evaluator.evaluate_stream(
+            dna,
+            trial_id=trial_id,
+            persist_trade_sink=persist_trade_batch,
+        )
+
+        monthly_metrics = MetricsCalculator().compute_monthly_metrics(trial_id)
+        return vars(dna).copy(), monthly_metrics
+
+    except Exception as e:
+        worker_log.error(
+            "ClickHouse worker evaluation failed",
+            dna_id=str(dna.id)[:8],
+            trial_id=trial_id,
+            error=str(e),
+            tb=traceback.format_exc()[-1000:],
+        )
+        return None
+    finally:
+        try:
+            loop.run_until_complete(trade_repo.close())
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+
+def _fetch_optuna_sample_data(symbol: str):
+    """Fetch a small ClickHouse sample for Optuna proxy evaluation."""
+
+    import clickhouse_connect
+    import polars as pl
+
+    client = clickhouse_connect.get_client(
+        host=settings.CH_HOST,
+        port=settings.CH_PORT,
+        database=settings.CH_DATABASE,
+        username=settings.CH_USER,
+        password=settings.CH_PASSWORD,
+        connect_timeout=10,
+        send_receive_timeout=300,
+    )
+    query = f"""
+        SELECT
+            timestamp,
+            bid,
+            ask,
+            bid_volume AS bid_size,
+            ask_volume AS ask_size
+        FROM `{settings.CH_DATABASE}`.`ticks`
+        WHERE instrument = '{symbol.replace("'", "\\'")}'
+        ORDER BY timestamp ASC
+        LIMIT 50000
+    """
+    try:
+        return pl.from_pandas(client.query_df(query))
+    except Exception as e:
+        log.warning("Optuna sample data fetch failed", symbol=symbol, error=str(e))
+        return pl.DataFrame()
 
 
 async def run_evolution(
@@ -71,7 +175,9 @@ async def run_evolution(
     constraint_eval = HardConstraintEvaluator()
     fitness_scorer = FitnessScorer()
     metrics_calc = MetricsCalculator()
-    backtest_runner = RayBacktestRunner()
+    strategy_repo = StrategyRepository()
+    trial_repo = TrialRepository()
+    sample_data_cache = {}
 
     # ── Hall of Fame (top 10 sepanjang masa) ─────────────────────────
     hall_of_fame: list = []
@@ -104,10 +210,62 @@ async def run_evolution(
 
         log.info('Generation start', gen=gen, pop_size=len(population))
 
-        # Step 1: Parallel backtest via Ray
-        # evaluate_population() return list[(StrategyDNA, pl.DataFrame)]
+        # Step 1: Optuna tuning, then parallel ClickHouse backtest via Ray.
+        tuned_population = []
+        for dna in population:
+            try:
+                tuner = OptunaTuner(
+                    study_name=f'gen{gen}',
+                    n_trials=settings.OPTUNA_N_TRIALS,
+                )
+                generator_for_class = DEAPGenerator(symbol=dna.symbol, timeframe=dna.timeframe)
+                if dna.symbol not in sample_data_cache:
+                    sample_data_cache[dna.symbol] = _fetch_optuna_sample_data(
+                        dna.symbol,
+                    )
+                sample_data = sample_data_cache[dna.symbol]
+                if not sample_data.is_empty():
+                    dna = tuner.tune(
+                        dna=dna,
+                        tick_data=sample_data,
+                        strategy_class_factory=generator_for_class.to_strategy_class,
+                    )
+                tuned_population.append(dna)
+            except Exception as e:
+                log.warning('Optuna tuning failed — using default params',
+                            dna_id=dna.id[:8], error=str(e))
+                tuned_population.append(dna)
+
+        for dna in tuned_population:
+            await strategy_repo.save(dna)
+
+        ray_futures = []
+        for dna in tuned_population:
+            trial_id = str(uuid.uuid4())
+            await trial_repo.save({
+                'id': trial_id,
+                'strategy_id': dna.id,
+                'optuna_trial_id': -1,
+                'study_name': f'gen{gen}_{dna.id[:8]}',
+                'params_json': dna.params,
+            })
+            ray_futures.append(
+                _evaluate_dna_clickhouse_remote.remote(
+                    vars(dna).copy(),
+                    trial_id,
+                )
+            )
+
+        log.info('ClickHouse Ray tasks dispatched', generation=gen, count=len(ray_futures))
+
+        raw_results = ray.get(ray_futures, timeout=3600) if ray_futures else []
         eval_results = []
-        eval_results = await backtest_runner.evaluate_population(population, gen)
+        for result in raw_results:
+            if result is None:
+                continue
+            dna_dict, monthly_metrics = result
+            eval_results.append((generator.dna_from_dict(dna_dict), monthly_metrics))
+
         total_evaluated += len(eval_results)
 
         # Step 2 & 3: Constraint check + Fitness scoring
@@ -148,7 +306,7 @@ async def run_evolution(
                     passed=constraint_result['passed'],
                     flags=constraint_result.get('flags', []),
                 )
-                await backtest_runner.trial_repo.update_results(
+                await trial_repo.update_results(
                     trial_id,
                     profit_factor=summary.get('avg_profit_factor'),
                     total_pips=total_pips,
@@ -157,7 +315,7 @@ async def run_evolution(
                     fitness_score=dna.fitness_score if constraint_result['passed'] else None,
                     eliminated_reason=dna.eliminated_reason,
                 )
-            await backtest_runner.strategy_repo.update_status(dna.id, dna.status)
+            await strategy_repo.update_status(dna.id, dna.status)
 
         log.info('Generation evaluated',
                  gen=gen,

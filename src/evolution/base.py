@@ -90,7 +90,7 @@ class BaseGenerator(ABC):
 class BaseEvaluator(ABC):
     """
     Kontrak untuk evaluasi fitness individu.
-    Pipeline: backtest → log → metrics → constraint → fitness.
+    Pipeline: ClickHouse vectorized backtest → log → metrics → constraint → fitness.
     JANGAN gabungkan step-step ini dalam satu fungsi.
     """
 
@@ -101,8 +101,8 @@ class BaseEvaluator(ABC):
 
         Urutan eksekusi WAJIB:
         1. Set status 'backtesting' di PostgreSQL
-        2. Jalankan NautilusTrader backtest
-        3. Flush trade_logs via AsyncTradeLogSync
+        2. Jalankan ClickHouse vectorized backtest
+        3. Flush trade_logs ke PostgreSQL
         4. Hitung monthly_metrics via MetricsCalculator
         5. Jalankan HardConstraintEvaluator
         6. Jika passed: jalankan FitnessScorer

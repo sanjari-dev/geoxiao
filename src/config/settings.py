@@ -31,8 +31,6 @@ class Settings(BaseSettings):
     N_GENERATIONS: int = 100
     POP_SIZE: int = 50
     OPTUNA_N_TRIALS: int = 30
-    BACKTEST_START: str = '2023-07-01'
-    BACKTEST_END: str = '2023-12-31'
 
     # Analytics
     USE_GPU: bool = False

@@ -13,7 +13,7 @@ class StrategyDNA:
     """
     Data Transfer Object untuk representasi genetik strategi.
     Digunakan sebagai antarmuka antara GP Generator, Optuna Tuner,
-    NautilusTrader Adapter, dan PostgreSQL Repository.
+    ClickHouse Evaluator, dan PostgreSQL Repository.
     """
     id: str = field(default=None)
     generation: int = 0

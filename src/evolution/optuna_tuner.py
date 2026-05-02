@@ -155,7 +155,7 @@ class OptunaTuner:
     ) -> float:
         """
         Proxy evaluation — jalankan strategi pada sample tick data
-        tanpa NautilusTrader (lightweight, cepat).
+        tanpa full vectorized backtest (lightweight, cepat).
 
         Tujuan: ranking parameter set, bukan menghasilkan P&L akurat.
         Menggunakan subset kecil dari tick data (max 50k baris).
