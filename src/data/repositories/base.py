@@ -6,6 +6,7 @@ read-only and is intentionally not referenced from this package.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import date, datetime
@@ -119,6 +120,24 @@ class AsyncPostgresRepository:
     def dsn(self) -> str:
         return self._dsn
 
+    @staticmethod
+    def _is_retryable_exception(exc: Exception) -> bool:
+        retryable_types = (
+            ConnectionError,
+            ConnectionResetError,
+            TimeoutError,
+            OSError,
+            asyncio.TimeoutError,
+            asyncpg.InterfaceError,
+            asyncpg.PostgresConnectionError,
+        )
+        current: BaseException | None = exc
+        while current is not None:
+            if isinstance(current, retryable_types):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
     async def pool(self) -> asyncpg.Pool:
         if self._pool is None:
             self._pool = await asyncpg.create_pool(
@@ -134,6 +153,31 @@ class AsyncPostgresRepository:
             await self._pool.close()
             self._pool = None
             log.info("PostgreSQL repository pool closed", repo=type(self).__name__)
+
+    async def _run_with_retry(
+        self,
+        operation,
+        *,
+        context: str,
+        attempts: int = 3,
+    ):
+        for attempt in range(1, attempts + 1):
+            try:
+                pool = await self.pool()
+                async with pool.acquire() as conn:
+                    return await operation(conn)
+            except Exception as exc:
+                if not self._is_retryable_exception(exc) or attempt >= attempts:
+                    raise
+                log.warning(
+                    "PostgreSQL operation failed; resetting pool and retrying",
+                    repo=type(self).__name__,
+                    context=context,
+                    attempt=attempt,
+                    error=repr(exc),
+                )
+                await self.close()
+                await asyncio.sleep(min(2 ** (attempt - 1), 5))
 
     async def __aenter__(self):
         await self.pool()

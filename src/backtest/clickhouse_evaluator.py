@@ -19,6 +19,7 @@ import clickhouse_connect
 import structlog
 
 from src.config.settings import settings
+from src.strategy.signal_utils import clamp_signal_threshold
 from src.strategy.base_strategy import StrategyDNA
 
 log = structlog.get_logger(__name__)
@@ -73,6 +74,41 @@ class RunningBacktestMetrics:
             "total_pips": self.cumulative_pips,
             "max_drawdown_pips": self.max_drawdown_pips,
         }
+
+
+@dataclass(frozen=True)
+class BacktestChunkSpec:
+    trade_start: datetime | None
+    trade_end: datetime | None
+    scan_start: datetime | None
+    scan_end: datetime | None
+
+
+@dataclass(frozen=True)
+class UnresolvedEntryInspection:
+    timeout_count: int
+    first_timeout_entry_time: datetime | None
+    pending_latest_count: int = 0
+    first_pending_latest_entry_time: datetime | None = None
+
+
+@dataclass(frozen=True)
+class UnresolvedTradeTimeoutError(RuntimeError):
+    timeout_count: int
+    max_holding_seconds: int
+    first_entry_time: datetime | None = None
+    partial_metrics: dict[str, Any] | None = None
+
+    def __str__(self) -> str:
+        first_entry = (
+            f", first_entry_time={self.first_entry_time.isoformat()}"
+            if self.first_entry_time is not None
+            else ""
+        )
+        return (
+            f"{self.timeout_count} trade(s) exceeded max_holding_seconds="
+            f"{self.max_holding_seconds}{first_entry}"
+        )
 
 
 class ClickHouseEvaluator:
@@ -189,7 +225,37 @@ class ClickHouseEvaluator:
             max_holding_seconds=self.max_holding_seconds,
         )
 
-        for query in self._iter_backtest_queries(dna):
+        for chunk in self._iter_backtest_chunks(dna):
+            unresolved = self._inspect_unresolved_entries(
+                dna,
+                chunk=chunk,
+            )
+            if unresolved.pending_latest_count > 0:
+                log.info(
+                    "Allowing unresolved latest-edge entries due to incomplete future data",
+                    strategy_id=dna.id,
+                    pending_latest_count=unresolved.pending_latest_count,
+                    first_pending_latest_entry_time=(
+                        unresolved.first_pending_latest_entry_time.isoformat()
+                        if unresolved.first_pending_latest_entry_time
+                        else None
+                    ),
+                )
+            if unresolved.timeout_count > 0:
+                raise UnresolvedTradeTimeoutError(
+                    timeout_count=unresolved.timeout_count,
+                    max_holding_seconds=self.max_holding_seconds,
+                    first_entry_time=unresolved.first_timeout_entry_time,
+                    partial_metrics=metrics.as_dict(),
+                )
+
+            query = self._build_query(
+                dna,
+                trade_start=chunk.trade_start,
+                trade_end=chunk.trade_end,
+                scan_start=chunk.scan_start,
+                scan_end=chunk.scan_end,
+            )
             self._stream_query(
                 query,
                 dna=dna,
@@ -228,9 +294,14 @@ class ClickHouseEvaluator:
                     self._flush_batch_to_sink(persist_trade_sink, batch)
                 del batch
 
-    def _iter_backtest_queries(self, dna: StrategyDNA) -> Iterable[str]:
+    def _iter_backtest_chunks(self, dna: StrategyDNA) -> Iterable[BacktestChunkSpec]:
         if self.chunk_days <= 0:
-            yield self._build_query(dna)
+            yield BacktestChunkSpec(
+                trade_start=None,
+                trade_end=None,
+                scan_start=None,
+                scan_end=None,
+            )
             return
 
         start, end = self._fetch_symbol_bounds(dna.symbol)
@@ -238,12 +309,17 @@ class ClickHouseEvaluator:
             return
 
         chunk_delta = timedelta(days=self.chunk_days)
-        warmup_delta = timedelta(seconds=max(self.feature_warmup_seconds, self.entry_cooldown_seconds))
         holding_delta = timedelta(seconds=self.max_holding_seconds)
+        feature_windows = self._feature_window_config(dna.params or {})
         chunk_start = start
         while chunk_start < end:
             chunk_end = min(chunk_start + chunk_delta, end + timedelta(microseconds=1))
-            scan_start = chunk_start - warmup_delta
+            scan_start = self._resolve_scan_start(
+                dna.symbol,
+                chunk_start=chunk_start,
+                absolute_start=start,
+                feature_windows=feature_windows,
+            )
             scan_end = chunk_end + holding_delta
             log.info(
                 "ClickHouse backtest chunk",
@@ -252,8 +328,7 @@ class ClickHouseEvaluator:
                 trade_start=chunk_start.isoformat(),
                 trade_end=chunk_end.isoformat(),
             )
-            yield self._build_query(
-                dna,
+            yield BacktestChunkSpec(
                 trade_start=chunk_start,
                 trade_end=chunk_end,
                 scan_start=scan_start,
@@ -283,25 +358,112 @@ WHERE instrument = '{self._escape_literal(symbol)}'
         scan_start: datetime | None = None,
         scan_end: datetime | None = None,
     ) -> str:
+        cte_sql = self._build_backtest_cte_sql(
+            dna,
+            trade_start=trade_start,
+            trade_end=trade_end,
+            scan_start=scan_start,
+            scan_end=scan_end,
+        )
+
+        return f"""
+{cte_sql},
+resolved_exits AS (
+    SELECT
+        h.entry_time,
+        h.exit_time,
+        h.side,
+        h.entry_price,
+        multiIf(
+            h.side = 'BUY' AND t.bid <= h.sl_price, h.sl_price,
+            h.side = 'BUY' AND t.bid >= h.tp_price, h.tp_price,
+            h.side = 'SELL' AND t.ask >= h.sl_price, h.sl_price,
+            h.side = 'SELL' AND t.ask <= h.tp_price, h.tp_price,
+            h.entry_price
+        ) AS exit_price
+    FROM exit_hits AS h
+    INNER JOIN base_ticks AS t
+        ON t.instrument = '{self._escape_literal(dna.symbol)}'
+       AND t.timestamp = h.exit_time
+)
+SELECT
+    entry_time,
+    exit_time,
+    side,
+    entry_price,
+    exit_price,
+    if(side = 'BUY',
+       (exit_price - entry_price) / pip,
+       (entry_price - exit_price) / pip) AS raw_pips
+FROM resolved_exits
+ORDER BY entry_time ASC
+"""
+
+    def _build_timeout_count_query(
+        self,
+        dna: StrategyDNA,
+        *,
+        trade_start: datetime | None = None,
+        trade_end: datetime | None = None,
+        scan_start: datetime | None = None,
+        scan_end: datetime | None = None,
+    ) -> str:
+        cte_sql = self._build_backtest_cte_sql(
+            dna,
+            trade_start=trade_start,
+            trade_end=trade_end,
+            scan_start=scan_start,
+            scan_end=scan_end,
+        )
+
+        return f"""
+{cte_sql}
+SELECT
+    countIf(
+        e.entry_time + toIntervalSecond(max_holding_seconds) <= data_bounds.last_tick
+    ) AS timeout_count,
+    minIf(
+        e.entry_time,
+        e.entry_time + toIntervalSecond(max_holding_seconds) <= data_bounds.last_tick
+    ) AS first_timeout_entry_time,
+    countIf(
+        e.entry_time + toIntervalSecond(max_holding_seconds) > data_bounds.last_tick
+    ) AS pending_latest_count,
+    minIf(
+        e.entry_time,
+        e.entry_time + toIntervalSecond(max_holding_seconds) > data_bounds.last_tick
+    ) AS first_pending_latest_entry_time
+FROM eligible_entries AS e
+LEFT JOIN exit_hits AS h
+    ON h.entry_time = e.entry_time
+   AND h.side = e.side
+   AND h.entry_price = e.entry_price
+   AND h.sl_price = e.sl_price
+   AND h.tp_price = e.tp_price
+CROSS JOIN (
+    SELECT max(timestamp) AS last_tick
+    FROM base_ticks
+) AS data_bounds
+WHERE h.exit_time IS NULL
+"""
+
+    def _build_backtest_cte_sql(
+        self,
+        dna: StrategyDNA,
+        *,
+        trade_start: datetime | None = None,
+        trade_end: datetime | None = None,
+        scan_start: datetime | None = None,
+        scan_end: datetime | None = None,
+    ) -> str:
         signal_sql = self._translate_dna_to_sql(dna)
         params = dna.params or {}
         sl_pips = float(params.get("sl_pips", 20.0))
         tp_pips = float(params.get("tp_pips", 40.0))
-        threshold = float(params.get("signal_threshold", 0.5))
+        threshold = clamp_signal_threshold(params.get("signal_threshold", 0.5))
+        normalized_signal_sql = self._normalize_signal_sql(signal_sql)
 
-        feature_windows = {
-            "obi": int(params.get("obi_window", 20)),
-            "tick_vel": int(params.get("tick_vel_window", 10)),
-            "spread_dyn": int(params.get("spread_dyn_window", 20)),
-            "tick_den": float(params.get("tick_den_window_sec", 60.0)),
-            "tick_den_rows": int(params.get("tick_den_rows", 200)),
-            "vol_skew": int(params.get("vol_skew_window", 30)),
-            "mid_mom_short": int(params.get("mid_mom_short", 5)),
-            "mid_mom_long": int(params.get("mid_mom_long", 20)),
-            "skew": int(params.get("skew_window", 30)),
-            "kurt": int(params.get("kurt_window", 30)),
-            "vw_spread": int(params.get("vw_spread_window", 20)),
-        }
+        feature_windows = self._feature_window_config(params)
         tick_filters = [f"instrument = '{self._escape_literal(dna.symbol)}'"]
         if scan_start is not None:
             tick_filters.append(f"timestamp >= {self._datetime64_literal(scan_start)}")
@@ -425,7 +587,7 @@ features AS (
 signal_base AS (
     SELECT
         *,
-        {signal_sql} AS signal_value,
+        {normalized_signal_sql} AS signal_value,
         multiIf(signal_value > signal_threshold, 'BUY',
                 signal_value < -signal_threshold, 'SELL',
                 'HOLD') AS side
@@ -471,7 +633,7 @@ entry_candidates AS (
 	    FROM filtered_entries
 	    {entry_where}
 	),
-	exit_hits AS (
+exit_hits AS (
     SELECT
         e.entry_time,
         e.side,
@@ -495,37 +657,34 @@ entry_candidates AS (
         e.sl_price,
         e.tp_price
     HAVING exit_time > toDateTime64('1970-01-01 00:00:00', 6, 'UTC')
-),
-resolved_exits AS (
-    SELECT
-        h.entry_time,
-        h.exit_time,
-        h.side,
-        h.entry_price,
-        multiIf(
-            h.side = 'BUY' AND t.bid <= h.sl_price, h.sl_price,
-            h.side = 'BUY' AND t.bid >= h.tp_price, h.tp_price,
-            h.side = 'SELL' AND t.ask >= h.sl_price, h.sl_price,
-            h.side = 'SELL' AND t.ask <= h.tp_price, h.tp_price,
-            h.entry_price
-        ) AS exit_price
-    FROM exit_hits AS h
-    INNER JOIN base_ticks AS t
-        ON t.instrument = '{self._escape_literal(dna.symbol)}'
-       AND t.timestamp = h.exit_time
-)
-SELECT
-    entry_time,
-    exit_time,
-    side,
-    entry_price,
-    exit_price,
-    if(side = 'BUY',
-       (exit_price - entry_price) / pip,
-       (entry_price - exit_price) / pip) AS raw_pips
-FROM resolved_exits
-ORDER BY entry_time ASC
 """
+
+    def _inspect_unresolved_entries(
+        self,
+        dna: StrategyDNA,
+        *,
+        chunk: BacktestChunkSpec,
+    ) -> UnresolvedEntryInspection:
+        query = self._build_timeout_count_query(
+            dna,
+            trade_start=chunk.trade_start,
+            trade_end=chunk.trade_end,
+            scan_start=chunk.scan_start,
+            scan_end=chunk.scan_end,
+        )
+        row = self.client.query(query).first_row
+        if row is None:
+            return UnresolvedEntryInspection(0, None, 0, None)
+        return UnresolvedEntryInspection(
+            timeout_count=int(row[0] or 0),
+            first_timeout_entry_time=(
+                self._ensure_datetime(row[1]) if row[1] is not None else None
+            ),
+            pending_latest_count=int(row[2] or 0),
+            first_pending_latest_entry_time=(
+                self._ensure_datetime(row[3]) if row[3] is not None else None
+            ),
+        )
 
     def _process_block(
         self,
@@ -595,6 +754,88 @@ ORDER BY entry_time ASC
 
         raise ValueError(f"Unsupported DNA AST node: {ast.dump(node)}")
 
+    @staticmethod
+    def _normalize_signal_sql(signal_sql: str) -> str:
+        return f"tanh(greatest(least(({signal_sql}), 20.0), -20.0))"
+
+    @staticmethod
+    def _feature_window_config(params: dict[str, Any]) -> dict[str, int | float]:
+        return {
+            "obi": int(params.get("obi_window", 20)),
+            "tick_vel": int(params.get("tick_vel_window", 10)),
+            "spread_dyn": int(params.get("spread_dyn_window", 20)),
+            "tick_den": float(params.get("tick_den_window_sec", 60.0)),
+            "tick_den_rows": int(params.get("tick_den_rows", 200)),
+            "vol_skew": int(params.get("vol_skew_window", 30)),
+            "mid_mom_short": int(params.get("mid_mom_short", 5)),
+            "mid_mom_long": int(params.get("mid_mom_long", 20)),
+            "skew": int(params.get("skew_window", 30)),
+            "kurt": int(params.get("kurt_window", 30)),
+            "vw_spread": int(params.get("vw_spread_window", 20)),
+        }
+
+    @staticmethod
+    def _required_feature_warmup_rows(feature_windows: dict[str, int | float]) -> int:
+        return max(
+            int(feature_windows["obi"]),
+            int(feature_windows["tick_vel"]),
+            int(feature_windows["spread_dyn"]),
+            int(feature_windows["tick_den_rows"]),
+            int(feature_windows["vol_skew"]),
+            int(feature_windows["mid_mom_long"]),
+            int(feature_windows["skew"]),
+            int(feature_windows["kurt"]),
+            int(feature_windows["vw_spread"]),
+            2,
+        ) + 1
+
+    def _resolve_scan_start(
+        self,
+        symbol: str,
+        *,
+        chunk_start: datetime,
+        absolute_start: datetime,
+        feature_windows: dict[str, int | float],
+    ) -> datetime:
+        """
+        Resolve scan_start using required historical row lookback, with a
+        conservative time-based fallback to preserve cooldown continuity.
+        """
+
+        fallback_start = chunk_start - timedelta(
+            seconds=max(self.feature_warmup_seconds, self.entry_cooldown_seconds)
+        )
+        rows_needed = self._required_feature_warmup_rows(feature_windows)
+        row_based_start = self._fetch_row_warmup_start(symbol, chunk_start, rows_needed)
+        if row_based_start is None:
+            return max(absolute_start, fallback_start)
+        return max(absolute_start, min(fallback_start, row_based_start))
+
+    def _fetch_row_warmup_start(
+        self,
+        symbol: str,
+        chunk_start: datetime,
+        rows_needed: int,
+    ) -> datetime | None:
+        if rows_needed <= 0:
+            return None
+
+        query = f"""
+SELECT min(timestamp) AS scan_start
+FROM (
+    SELECT timestamp
+    FROM {self._quoted_table()}
+    WHERE instrument = '{self._escape_literal(symbol)}'
+      AND timestamp < {self._datetime64_literal(chunk_start)}
+    ORDER BY timestamp DESC
+    LIMIT {rows_needed:d}
+)
+"""
+        row = self.client.query(query).first_row
+        if row is None or row[0] is None:
+            return None
+        return self._ensure_datetime(row[0])
+
     def _quoted_table(self) -> str:
         return f"{self._quote_identifier(self.database)}.{self._quote_identifier(self.ticks_table)}"
 
@@ -645,4 +886,10 @@ ORDER BY entry_time ASC
         raise TypeError("persist_trade_sink must be callable or expose enqueue(trade)")
 
 
-__all__ = ["ClickHouseEvaluator", "RunningBacktestMetrics"]
+__all__ = [
+    "BacktestChunkSpec",
+    "ClickHouseEvaluator",
+    "RunningBacktestMetrics",
+    "UnresolvedEntryInspection",
+    "UnresolvedTradeTimeoutError",
+]

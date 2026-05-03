@@ -6,8 +6,10 @@ import optuna
 import polars as pl
 import numpy as np
 from typing import Callable
+from dataclasses import dataclass
 
 from src.strategy.base_strategy import StrategyDNA
+from src.strategy.signal_utils import clamp_signal_threshold, MIN_SIGNAL_THRESHOLD, MAX_SIGNAL_THRESHOLD
 from src.config.settings import settings
 import structlog
 
@@ -15,6 +17,20 @@ log = structlog.get_logger(__name__)
 
 # Suppress Optuna verbosity — gunakan structlog
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+@dataclass(frozen=True)
+class SignalDiagnostics:
+    threshold: float
+    windows_evaluated: int
+    entry_candidates: int
+    min_signal: float
+    max_signal: float
+    error: str | None = None
+
+    @property
+    def viable(self) -> bool:
+        return self.error is not None or self.entry_candidates > 0
 
 
 class OptunaTuner:
@@ -133,7 +149,11 @@ class OptunaTuner:
             'sl_pips':             sl_pips,
             # TP minimum 1.5x SL untuk ensure positive expectancy
             'tp_pips':             trial.suggest_float('tp_pips', sl_pips * 1.5, 150.0),
-            'signal_threshold':    trial.suggest_float('signal_threshold', 0.1, 2.0),
+            'signal_threshold':    trial.suggest_float(
+                'signal_threshold',
+                MIN_SIGNAL_THRESHOLD,
+                MAX_SIGNAL_THRESHOLD,
+            ),
             'obi_window':          trial.suggest_int('obi_window', 10, 50),
             'tick_vel_window':     trial.suggest_int('tick_vel_window', 5, 30),
             'spread_dyn_window':   trial.suggest_int('spread_dyn_window', 10, 60),
@@ -177,13 +197,13 @@ class OptunaTuner:
             strategy.validate_params()
 
             # Sample max 50k baris untuk kecepatan
-            sample = tick_data.head(50_000)
+            sample = self._prepare_tick_data(tick_data.head(50_000))
             if len(sample) < 100:
                 return -9999.0
 
             sl_pips = params['sl_pips']
             tp_pips = params['tp_pips']
-            threshold = params['signal_threshold']
+            params['signal_threshold'] = clamp_signal_threshold(params.get('signal_threshold'))
 
             # Sliding window evaluation
             min_window = max(params.get('mid_mom_long', 20),
@@ -235,3 +255,106 @@ class OptunaTuner:
         except Exception as e:
             log.debug('Proxy evaluation failed', error=str(e))
             return -9999.0  # Worst possible score — Optuna akan menghindari params ini
+
+    def analyze_signal_diagnostics(
+        self,
+        dna: StrategyDNA,
+        tick_data: pl.DataFrame,
+        strategy_class_factory: Callable,
+    ) -> SignalDiagnostics:
+        """Estimate whether a DNA can produce any actionable signal at all."""
+
+        params = dict(dna.params or {})
+        threshold = clamp_signal_threshold(params.get('signal_threshold'))
+
+        try:
+            dna_copy = type(dna)(**{
+                f.name: getattr(dna, f.name)
+                for f in dna.__dataclass_fields__.values()  # type: ignore
+            })
+            dna_copy.params = {**params, 'signal_threshold': threshold}
+            StrategyClass = strategy_class_factory(dna_copy)
+            strategy = StrategyClass(dna_copy)
+            strategy.validate_params()
+        except Exception as e:
+            log.warning('Signal diagnostics setup failed', dna_id=dna.id[:8], error=str(e))
+            return SignalDiagnostics(
+                threshold=threshold,
+                windows_evaluated=0,
+                entry_candidates=0,
+                min_signal=0.0,
+                max_signal=0.0,
+                error=str(e),
+            )
+
+        sample = self._prepare_tick_data(tick_data.head(50_000))
+        if len(sample) < 100:
+            return SignalDiagnostics(
+                threshold=threshold,
+                windows_evaluated=0,
+                entry_candidates=0,
+                min_signal=0.0,
+                max_signal=0.0,
+                error='insufficient_sample',
+            )
+
+        min_window = max(params.get('mid_mom_long', 20), params.get('obi_window', 20)) + 10
+        step = max(1, min_window // 4)
+        min_signal = float('inf')
+        max_signal = float('-inf')
+        entry_candidates = 0
+        windows_evaluated = 0
+
+        try:
+            for i in range(min_window, len(sample) - 1, step):
+                window = sample.slice(max(0, i - min_window * 2), min_window * 2)
+                features = strategy.compute_features(window)
+                signal_value = float(strategy.compute_signal_value(features))
+                min_signal = min(min_signal, signal_value)
+                max_signal = max(max_signal, signal_value)
+                windows_evaluated += 1
+                if signal_value > threshold or signal_value < -threshold:
+                    entry_candidates += 1
+        except Exception as e:
+            log.warning(
+                'Signal diagnostics evaluation failed',
+                dna_id=dna.id[:8],
+                error=str(e),
+            )
+            return SignalDiagnostics(
+                threshold=threshold,
+                windows_evaluated=windows_evaluated,
+                entry_candidates=0,
+                min_signal=0.0 if min_signal == float('inf') else min_signal,
+                max_signal=0.0 if max_signal == float('-inf') else max_signal,
+                error=str(e),
+            )
+
+        if windows_evaluated == 0:
+            min_signal = 0.0
+            max_signal = 0.0
+
+        return SignalDiagnostics(
+            threshold=threshold,
+            windows_evaluated=windows_evaluated,
+            entry_candidates=entry_candidates,
+            min_signal=min_signal,
+            max_signal=max_signal,
+        )
+
+    @staticmethod
+    def _prepare_tick_data(tick_data: pl.DataFrame) -> pl.DataFrame:
+        """Normalize ClickHouse-decimal samples into float arrays for NumPy code."""
+
+        if tick_data.is_empty():
+            return tick_data
+
+        cast_exprs = []
+        for col in ('bid', 'ask', 'bid_size', 'ask_size'):
+            if col in tick_data.columns:
+                cast_exprs.append(pl.col(col).cast(pl.Float64, strict=False).alias(col))
+
+        if not cast_exprs:
+            return tick_data
+
+        return tick_data.with_columns(cast_exprs)

@@ -53,8 +53,7 @@ class StrategyRepository(AsyncPostgresRepository):
         if dna.status not in self.VALID_STATUSES:
             raise ValueError(f"Invalid strategy status: {dna.status}")
 
-        pool = await self.pool()
-        async with pool.acquire() as conn:
+        async def _save(conn):
             strategy_id = await conn.fetchval(
                 self._UPSERT_SQL,
                 as_uuid(dna.id),
@@ -68,6 +67,9 @@ class StrategyRepository(AsyncPostgresRepository):
                 dna.timeframe,
                 dna.status,
             )
+            return strategy_id
+
+        strategy_id = await self._run_with_retry(_save, context="save")
 
         dna.id = str(strategy_id)
         log.info(
@@ -82,8 +84,7 @@ class StrategyRepository(AsyncPostgresRepository):
     async def get(self, strategy_id: str) -> StrategyDNA | None:
         """Fetch a strategy by id."""
 
-        pool = await self.pool()
-        async with pool.acquire() as conn:
+        async def _get(conn):
             row = await conn.fetchrow(
                 """
                 SELECT id::text, generation, individual_id, tree_repr,
@@ -94,13 +95,14 @@ class StrategyRepository(AsyncPostgresRepository):
                 """,
                 as_uuid(strategy_id),
             )
+            return row
+        row = await self._run_with_retry(_get, context="get")
         return self._row_to_dna(row) if row else None
 
     async def list_by_generation(self, generation: int) -> list[StrategyDNA]:
         """Return all strategies for a generation ordered by creation time."""
 
-        pool = await self.pool()
-        async with pool.acquire() as conn:
+        async def _list(conn):
             rows = await conn.fetch(
                 """
                 SELECT id::text, generation, individual_id, tree_repr,
@@ -112,6 +114,8 @@ class StrategyRepository(AsyncPostgresRepository):
                 """,
                 int(generation),
             )
+            return rows
+        rows = await self._run_with_retry(_list, context="list_by_generation")
         return [self._row_to_dna(row) for row in rows]
 
     async def update_status(self, strategy_id: str, status: str) -> None:
@@ -120,8 +124,7 @@ class StrategyRepository(AsyncPostgresRepository):
         if status not in self.VALID_STATUSES:
             raise ValueError(f"Invalid strategy status: {status}")
 
-        pool = await self.pool()
-        async with pool.acquire() as conn:
+        async def _update(conn):
             result = await conn.execute(
                 """
                 UPDATE strategy_dna
@@ -131,6 +134,9 @@ class StrategyRepository(AsyncPostgresRepository):
                 as_uuid(strategy_id),
                 status,
             )
+            return result
+
+        result = await self._run_with_retry(_update, context="update_status")
 
         log.info("Strategy status updated", strategy_id=strategy_id, status=status, result=result)
 

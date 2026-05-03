@@ -42,3 +42,28 @@ def test_no_classical_indicators_in_tree(generator):
         for indicator in banned:
             assert indicator not in tree_lower, \
                 f'Banned indicator {indicator} ditemukan dalam tree: {dna.tree_repr}'
+
+
+def test_generated_strategy_supports_gp_alias_functions(generator):
+    dna = generator.initialize_population(2)[0]
+    dna.tree_repr = "sub(add(obi, tick_vel), mul(sign(kurtosis), 0.5))"
+    dna.params = {'sl_pips': 20.0, 'tp_pips': 40.0, 'signal_threshold': 0.5}
+
+    StrategyClass = generator.to_strategy_class(dna)
+    strategy = StrategyClass(dna)
+
+    signal = strategy.compute_signal_value(
+        {
+            'obi': 0.2,
+            'tick_vel': 0.4,
+            'spread_dyn': 0.1,
+            'tick_den': 0.1,
+            'vol_skew': 0.0,
+            'mid_mom': 0.1,
+            'skewness': 0.0,
+            'kurtosis': -2.0,
+            'vw_spread': 0.1,
+        }
+    )
+
+    assert isinstance(signal, float)

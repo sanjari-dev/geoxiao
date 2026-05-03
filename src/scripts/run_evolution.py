@@ -58,7 +58,10 @@ def _evaluate_dna_clickhouse_remote(
     import structlog
 
     from src.analytics.metrics_calculator import MetricsCalculator
-    from src.backtest.clickhouse_evaluator import ClickHouseEvaluator
+    from src.backtest.clickhouse_evaluator import (
+        ClickHouseEvaluator,
+        UnresolvedTradeTimeoutError,
+    )
     from src.data.repositories.trade_repo import TradeRepository
     from src.strategy.base_strategy import StrategyDNA
 
@@ -82,14 +85,43 @@ def _evaluate_dna_clickhouse_remote(
             loop.run_until_complete(trade_repo.batch_insert(batch))
 
         evaluator = ClickHouseEvaluator()
-        evaluator.evaluate_stream(
+        evaluation_summary = evaluator.evaluate_stream(
             dna,
             trial_id=trial_id,
             persist_trade_sink=persist_trade_batch,
         )
 
         monthly_metrics = MetricsCalculator().compute_monthly_metrics(trial_id)
-        return vars(dna).copy(), monthly_metrics
+        return vars(dna).copy(), monthly_metrics, evaluation_summary
+
+    except UnresolvedTradeTimeoutError as e:
+        dna.status = 'eliminated'
+        first_entry = (
+            f", first_entry_time={e.first_entry_time.isoformat()}"
+            if e.first_entry_time is not None
+            else ""
+        )
+        dna.eliminated_reason = (
+            f'UNRESOLVED_TRADE_TIMEOUT: {e.timeout_count} trade(s) exceeded '
+            f'max_holding_seconds={e.max_holding_seconds}{first_entry}'
+        )
+        worker_log.warning(
+            "Strategy eliminated due to unresolved trade timeout",
+            dna_id=str(dna.id)[:8],
+            trial_id=trial_id,
+            timeout_count=e.timeout_count,
+            max_holding_seconds=e.max_holding_seconds,
+            first_entry_time=e.first_entry_time.isoformat() if e.first_entry_time else None,
+        )
+        return vars(dna).copy(), None, {
+            "trial_id": trial_id,
+            "unresolved_entry_count": e.timeout_count,
+            "first_unresolved_entry_time": (
+                e.first_entry_time.isoformat() if e.first_entry_time else None
+            ),
+            "eliminated_reason": dna.eliminated_reason,
+            **(e.partial_metrics or {}),
+        }
 
     except Exception as e:
         worker_log.error(
@@ -212,6 +244,7 @@ async def run_evolution(
 
         # Step 1: Optuna tuning, then parallel ClickHouse backtest via Ray.
         tuned_population = []
+        skipped_impossible = 0
         for dna in population:
             try:
                 tuner = OptunaTuner(
@@ -230,11 +263,51 @@ async def run_evolution(
                         tick_data=sample_data,
                         strategy_class_factory=generator_for_class.to_strategy_class,
                     )
+                    diagnostics = tuner.analyze_signal_diagnostics(
+                        dna=dna,
+                        tick_data=sample_data,
+                        strategy_class_factory=generator_for_class.to_strategy_class,
+                    )
+                    if not diagnostics.viable:
+                        dna.status = 'eliminated'
+                        dna.eliminated_reason = (
+                            'NO_SIGNAL_CANDIDATES: normalized signal never crossed '
+                            f'threshold={diagnostics.threshold:.4f} '
+                            f'(min={diagnostics.min_signal:.4f}, max={diagnostics.max_signal:.4f}, '
+                            f'windows={diagnostics.windows_evaluated})'
+                        )
+                        skipped_impossible += 1
+                        log.warning(
+                            'Skipping impossible strategy before full backtest',
+                            dna_id=dna.id[:8],
+                            threshold=diagnostics.threshold,
+                            min_signal=diagnostics.min_signal,
+                            max_signal=diagnostics.max_signal,
+                            windows=diagnostics.windows_evaluated,
+                        )
+                        await strategy_repo.save(dna)
+                        continue
                 tuned_population.append(dna)
             except Exception as e:
                 log.warning('Optuna tuning failed — using default params',
                             dna_id=dna.id[:8], error=str(e))
                 tuned_population.append(dna)
+
+        if skipped_impossible:
+            log.info(
+                'Generation impossible strategies skipped',
+                gen=gen,
+                skipped=skipped_impossible,
+                viable=len(tuned_population),
+            )
+
+        if not tuned_population:
+            log.warning(
+                'No viable strategies after tuning diagnostics — reinitializing population',
+                generation=gen,
+            )
+            population = generator.initialize_population(p_size)
+            continue
 
         for dna in tuned_population:
             await strategy_repo.save(dna)
@@ -281,14 +354,41 @@ async def run_evolution(
             for result in raw_results:
                 if result is None:
                     continue
-                dna_dict, monthly_metrics = result
-                eval_results.append((generator.dna_from_dict(dna_dict), monthly_metrics))
+                dna_dict, monthly_metrics, evaluation_summary = result
+                eval_results.append(
+                    (
+                        generator.dna_from_dict(dna_dict),
+                        monthly_metrics,
+                        evaluation_summary,
+                    )
+                )
 
         total_evaluated += len(eval_results)
 
         # Step 2 & 3: Constraint check + Fitness scoring
         survivors = []
-        for dna, monthly_metrics in eval_results:
+        for dna, monthly_metrics, evaluation_summary in eval_results:
+            if monthly_metrics is None:
+                trial_id = evaluation_summary.get('trial_id') if evaluation_summary else None
+                dna.status = 'eliminated'
+                dna.eliminated_reason = (
+                    evaluation_summary.get('eliminated_reason')
+                    if evaluation_summary
+                    else 'UNRESOLVED_TRADE_TIMEOUT'
+                )
+                if trial_id:
+                    await trial_repo.update_results(
+                        trial_id,
+                        profit_factor=evaluation_summary.get('profit_factor'),
+                        total_pips=evaluation_summary.get('total_pips'),
+                        max_drawdown_pips=evaluation_summary.get('max_drawdown_pips'),
+                        trade_count=evaluation_summary.get('total_trades'),
+                        fitness_score=None,
+                        eliminated_reason=dna.eliminated_reason,
+                    )
+                await strategy_repo.update_status(dna.id, dna.status)
+                continue
+
             constraint_result = constraint_eval.evaluate(monthly_metrics)
             trial_id = (
                 str(monthly_metrics['trial_id'][0])

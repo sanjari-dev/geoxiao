@@ -14,6 +14,7 @@ from deap import base, creator, gp, tools, algorithms
 
 from src.evolution.base import BaseGenerator
 from src.strategy.base_strategy import StrategyDNA, BaseStrategy
+from src.strategy.signal_utils import clamp_signal_threshold
 from src.config.settings import settings
 from src.evolution.primitives import (
     safe_div, safe_log, safe_sqrt, neg, square, cube, sigmoid, sign_fn,
@@ -31,6 +32,26 @@ if not hasattr(creator, 'FitnessMax'):
     creator.create('FitnessMax', base.Fitness, weights=(1.0,))
 if not hasattr(creator, 'Individual'):
     creator.create('Individual', gp.PrimitiveTree, fitness=creator.FitnessMax)
+
+
+def _add(a, b):
+    return a + b
+
+
+def _sub(a, b):
+    return a - b
+
+
+def _mul(a, b):
+    return a * b
+
+
+def _const_small() -> float:
+    return round(random.uniform(-2.0, 2.0), 4)
+
+
+def _const_large() -> float:
+    return round(random.uniform(-10.0, 10.0), 4)
 
 
 def _build_primitive_set() -> gp.PrimitiveSet:
@@ -59,9 +80,9 @@ def _build_primitive_set() -> gp.PrimitiveSet:
     )
 
     # ── Binary operators ─────────────────────────────────────────────
-    pset.addPrimitive(lambda a,b: a+b, 2, name='add')
-    pset.addPrimitive(lambda a,b: a-b, 2, name='sub')
-    pset.addPrimitive(lambda a,b: a*b, 2, name='mul')
+    pset.addPrimitive(_add,             2, name='add')
+    pset.addPrimitive(_sub,             2, name='sub')
+    pset.addPrimitive(_mul,             2, name='mul')
     pset.addPrimitive(safe_div,         2, name='div')
     pset.addPrimitive(max2,             2, name='max2')
     pset.addPrimitive(min2,             2, name='min2')
@@ -76,8 +97,8 @@ def _build_primitive_set() -> gp.PrimitiveSet:
     pset.addPrimitive(sign_fn,  1, name='sign')
 
     # ── Ephemeral constants (random float di generate time) ──────────
-    pset.addEphemeralConstant('const_small', lambda: round(random.uniform(-2.0, 2.0), 4))
-    pset.addEphemeralConstant('const_large', lambda: round(random.uniform(-10.0, 10.0), 4))
+    pset.addEphemeralConstant('const_small', _const_small)
+    pset.addEphemeralConstant('const_large', _const_large)
 
     return pset
 
@@ -262,14 +283,12 @@ class DEAPGenerator(BaseGenerator):
         Generate Python source code untuk strategy class.
         Pohon GP di-compile menjadi Python expression via gp.compile().
         """
-        # Compile pohon GP menjadi callable Python function
         deap_ind = self._dna_to_deap(dna)
-        compiled_fn = gp.compile(deap_ind, self.pset)
 
         # Ekstrak params yang sudah di-tune Optuna
         sl_pips    = dna.params.get('sl_pips', 20.0)
         tp_pips    = dna.params.get('tp_pips', 40.0)
-        threshold  = dna.params.get('signal_threshold', 0.5)
+        threshold  = clamp_signal_threshold(dna.params.get('signal_threshold', 0.5))
         obi_w      = dna.params.get('obi_window', 20)
         tv_w       = dna.params.get('tick_vel_window', 10)
         sd_w       = dna.params.get('spread_dyn_window', 20)
@@ -291,12 +310,21 @@ class DEAPGenerator(BaseGenerator):
             from __future__ import annotations
             import numpy as np
             from src.strategy.base_strategy import BaseStrategy, StrategyDNA
+            from src.strategy.signal_utils import normalize_signal_value
             from src.evolution.primitives import (
                 safe_div, safe_log, safe_sqrt, neg, square, cube, sigmoid, sign_fn,
                 max2, min2, order_book_imbalance, tick_velocity, spread_dynamics,
                 tick_density, volume_clock_skew, mid_price_momentum,
                 rolling_skewness, rolling_kurtosis, volume_weighted_spread,
             )
+
+            add = lambda a, b: a + b
+            sub = lambda a, b: a - b
+            mul = lambda a, b: a * b
+            div = safe_div
+            log = safe_log
+            sqrt = safe_sqrt
+            sign = sign_fn
 
             class {class_name}(BaseStrategy):
                 """Auto-generated strategy from DEAP GP tree."""
@@ -323,7 +351,7 @@ class DEAPGenerator(BaseGenerator):
                         'vw_spread':  volume_weighted_spread(bid, ask, bid_size, ask_size, {vws_w}),
                     }}
 
-                def generate_signal(self, features: dict) -> dict | None:
+                def compute_signal_value(self, features: dict) -> float:
                     obi        = features['obi']
                     tick_vel   = features['tick_vel']
                     spread_dyn = features['spread_dyn']
@@ -333,8 +361,11 @@ class DEAPGenerator(BaseGenerator):
                     skewness   = features['skewness']
                     kurtosis   = features['kurtosis']
                     vw_spread  = features['vw_spread']
-                    # GP tree expression — compiled dari DEAP
-                    signal = {tree_expr}
+                    raw_signal = {tree_expr}
+                    return normalize_signal_value(raw_signal)
+
+                def generate_signal(self, features: dict) -> dict | None:
+                    signal = self.compute_signal_value(features)
                     if signal > self.THRESHOLD:
                         return {{'side': 'BUY',  'sl_pips': self.SL_PIPS,
                                 'tp_pips': self.TP_PIPS, 'order_type': 'LIMIT'}}

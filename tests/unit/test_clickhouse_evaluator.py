@@ -4,7 +4,13 @@ from datetime import datetime, timezone
 
 import pytest
 
-from src.backtest.clickhouse_evaluator import ClickHouseEvaluator, RunningBacktestMetrics
+from src.backtest.clickhouse_evaluator import (
+    BacktestChunkSpec,
+    ClickHouseEvaluator,
+    RunningBacktestMetrics,
+    UnresolvedEntryInspection,
+    UnresolvedTradeTimeoutError,
+)
 from src.strategy.base_strategy import StrategyDNA
 
 
@@ -15,6 +21,8 @@ def _evaluator_without_connection() -> ClickHouseEvaluator:
     evaluator.block_size = 10_000
     evaluator.max_holding_seconds = 86_400
     evaluator.entry_cooldown_seconds = 60
+    evaluator.chunk_days = 7
+    evaluator.feature_warmup_seconds = 3_600
     evaluator.client = None
     return evaluator
 
@@ -79,3 +87,134 @@ def test_process_block_formats_trade_logs_and_updates_metrics():
     assert batch[0]["backtest_month"].isoformat() == "2024-01-01"
     assert batch[0]["sl_price"] == pytest.approx(1.099)
     assert batch[0]["tp_price"] == pytest.approx(1.102)
+
+
+def test_normalize_signal_sql_wraps_expression():
+    evaluator = _evaluator_without_connection()
+
+    sql = evaluator._normalize_signal_sql("obi + tick_vel")
+
+    assert "tanh" in sql
+    assert "obi + tick_vel" in sql
+
+
+def test_required_feature_warmup_rows_uses_largest_window():
+    rows = ClickHouseEvaluator._required_feature_warmup_rows(
+        ClickHouseEvaluator._feature_window_config(
+            {
+                "obi_window": 20,
+                "tick_vel_window": 10,
+                "spread_dyn_window": 30,
+                "tick_den_rows": 250,
+                "vol_skew_window": 40,
+                "mid_mom_long": 60,
+                "skew_window": 55,
+                "kurt_window": 45,
+                "vw_spread_window": 35,
+            }
+        )
+    )
+
+    assert rows == 251
+
+
+def test_resolve_scan_start_prefers_row_history_when_earlier(monkeypatch):
+    evaluator = _evaluator_without_connection()
+    absolute_start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    chunk_start = datetime(2024, 1, 8, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        evaluator,
+        "_fetch_row_warmup_start",
+        lambda symbol, start, rows: datetime(2024, 1, 5, tzinfo=timezone.utc),
+    )
+
+    scan_start = evaluator._resolve_scan_start(
+        "AUDUSD",
+        chunk_start=chunk_start,
+        absolute_start=absolute_start,
+        feature_windows=evaluator._feature_window_config({}),
+    )
+
+    assert scan_start == datetime(2024, 1, 5, tzinfo=timezone.utc)
+
+
+def test_resolve_scan_start_falls_back_to_time_overlap(monkeypatch):
+    evaluator = _evaluator_without_connection()
+    absolute_start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    chunk_start = datetime(2024, 1, 8, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(evaluator, "_fetch_row_warmup_start", lambda symbol, start, rows: None)
+
+    scan_start = evaluator._resolve_scan_start(
+        "AUDUSD",
+        chunk_start=chunk_start,
+        absolute_start=absolute_start,
+        feature_windows=evaluator._feature_window_config({}),
+    )
+
+    assert scan_start == datetime(2024, 1, 7, 23, 0, tzinfo=timezone.utc)
+
+
+def test_evaluate_stream_raises_when_trade_timeout_detected(monkeypatch):
+    evaluator = _evaluator_without_connection()
+    dna = StrategyDNA(tree_repr="obi", symbol="AUDUSD")
+
+    monkeypatch.setattr(
+        evaluator,
+        "_iter_backtest_chunks",
+        lambda dna: [
+            BacktestChunkSpec(
+                trade_start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                trade_end=datetime(2024, 1, 8, tzinfo=timezone.utc),
+                scan_start=datetime(2023, 12, 31, tzinfo=timezone.utc),
+                scan_end=datetime(2024, 1, 8, 1, tzinfo=timezone.utc),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_inspect_unresolved_entries",
+        lambda dna, chunk: UnresolvedEntryInspection(
+            timeout_count=2,
+            first_timeout_entry_time=datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc),
+        ),
+    )
+
+    with pytest.raises(UnresolvedTradeTimeoutError, match="2 trade\\(s\\) exceeded"):
+        evaluator.evaluate_stream(dna, trial_id="trial-1")
+
+
+def test_evaluate_stream_allows_latest_edge_unresolved_entries(monkeypatch):
+    evaluator = _evaluator_without_connection()
+    dna = StrategyDNA(tree_repr="obi", symbol="AUDUSD")
+
+    monkeypatch.setattr(
+        evaluator,
+        "_iter_backtest_chunks",
+        lambda dna: [
+            BacktestChunkSpec(
+                trade_start=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                trade_end=datetime(2024, 1, 8, tzinfo=timezone.utc),
+                scan_start=datetime(2023, 12, 31, tzinfo=timezone.utc),
+                scan_end=datetime(2024, 1, 8, 1, tzinfo=timezone.utc),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_inspect_unresolved_entries",
+        lambda dna, chunk: UnresolvedEntryInspection(
+            timeout_count=0,
+            first_timeout_entry_time=None,
+            pending_latest_count=1,
+            first_pending_latest_entry_time=datetime(2024, 1, 7, 23, 55, tzinfo=timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(evaluator, "_build_query", lambda dna, **kwargs: "SELECT 1")
+    monkeypatch.setattr(evaluator, "_stream_query", lambda query, **kwargs: None)
+
+    result = evaluator.evaluate_stream(dna, trial_id="trial-1")
+
+    assert result["trial_id"] == "trial-1"
+    assert result["total_trades"] == 0

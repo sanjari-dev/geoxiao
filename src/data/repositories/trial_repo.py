@@ -61,8 +61,7 @@ class TrialRepository(AsyncPostgresRepository):
         )
 
         trial_id = str(trial.get("id") or uuid.uuid4())
-        pool = await self.pool()
-        async with pool.acquire() as conn:
+        async def _save(conn):
             saved_id = await conn.fetchval(
                 self._UPSERT_SQL,
                 as_uuid(trial_id),
@@ -78,6 +77,9 @@ class TrialRepository(AsyncPostgresRepository):
                 trial.get("eliminated_reason"),
                 as_decimal(trial.get("duration_sec")),
             )
+            return saved_id
+
+        saved_id = await self._run_with_retry(_save, context="save")
 
         log.info(
             "Trial log saved",
@@ -119,8 +121,7 @@ class TrialRepository(AsyncPostgresRepository):
     ) -> None:
         """Update final metrics for an existing trial."""
 
-        pool = await self.pool()
-        async with pool.acquire() as conn:
+        async def _update(conn):
             result = await conn.execute(
                 """
                 UPDATE trial_logs
@@ -142,6 +143,9 @@ class TrialRepository(AsyncPostgresRepository):
                 eliminated_reason,
                 as_decimal(duration_sec),
             )
+            return result
+
+        result = await self._run_with_retry(_update, context="update_results")
 
         log.info("Trial results updated", trial_id=trial_id, result=result)
 
@@ -159,8 +163,7 @@ class TrialRepository(AsyncPostgresRepository):
         return trial_id, float(trial.get("duration_sec") or 0.0)
 
     async def get(self, trial_id: str) -> dict[str, Any] | None:
-        pool = await self.pool()
-        async with pool.acquire() as conn:
+        async def _get(conn):
             row = await conn.fetchrow(
                 """
                 SELECT id::text, strategy_id::text, optuna_trial_id, study_name,
@@ -172,6 +175,8 @@ class TrialRepository(AsyncPostgresRepository):
                 """,
                 as_uuid(trial_id),
             )
+            return row
+        row = await self._run_with_retry(_get, context="get")
         if not row:
             return None
         result = dict(row)

@@ -95,6 +95,15 @@ class BaseStrategy(ABC):
         """
         ...
 
+    def compute_signal_value(self, features: Any) -> float:
+        """
+        Return scalar signal sebelum dikonversi menjadi keputusan BUY/SELL/HOLD.
+
+        Default implementation sengaja melempar agar subclass eksplisit
+        menyediakan signal numeriknya jika dibutuhkan untuk diagnostics.
+        """
+        raise NotImplementedError("Strategy subclass must implement compute_signal_value()")
+
     @abstractmethod
     def validate_params(self) -> bool:
         """
