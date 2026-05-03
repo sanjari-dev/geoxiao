@@ -7,7 +7,6 @@ name = "geoxiao"
 version = "1.0.0"
 requires-python = ">=3.11"
 dependencies = [
-    "nautilus_trader>=1.200.0",
     "deap>=1.4.1",
     "optuna>=3.6.0",
     "polars>=0.20.0",

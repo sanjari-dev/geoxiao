@@ -8,6 +8,7 @@ import pytest
 
 from src.config.settings import settings
 from src.data.repositories.base import postgres_asyncpg_dsn
+from src.data.repositories.base import AsyncPostgresRepository
 from src.data.repositories.strategy_repo import StrategyRepository
 from src.data.repositories.trade_repo import TradeRepository
 
@@ -92,3 +93,8 @@ def test_trade_to_tuple_rejects_invalid_side():
                 "backtest_month": date(2024, 1, 1),
             }
         )
+
+
+def test_repository_retry_classifier_flags_connection_errors():
+    assert AsyncPostgresRepository._is_retryable_exception(ConnectionResetError("boom")) is True
+    assert AsyncPostgresRepository._is_retryable_exception(ValueError("boom")) is False

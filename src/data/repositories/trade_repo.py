@@ -70,15 +70,18 @@ class TradeRepository(AsyncPostgresRepository):
             return 0
 
         rows = [self._to_tuple(t) for t in trade_list]
-        pool = await self.pool()
-
         inserted = 0
-        async with pool.acquire() as conn:
+
+        async def _insert(conn):
+            nonlocal inserted
             async with conn.transaction():
                 for start in range(0, len(rows), chunk_size):
                     chunk = rows[start : start + chunk_size]
                     await conn.executemany(self._INSERT_SQL, chunk)
                     inserted += len(chunk)
+            return inserted
+
+        inserted = await self._run_with_retry(_insert, context="batch_insert")
 
         log.info("Trade logs inserted", count=inserted)
         return inserted
@@ -86,8 +89,7 @@ class TradeRepository(AsyncPostgresRepository):
     async def list_by_trial(self, trial_id: str, *, limit: int = 1_000) -> list[dict[str, Any]]:
         """Fetch recent trade logs for a trial for diagnostics/tests."""
 
-        pool = await self.pool()
-        async with pool.acquire() as conn:
+        async def _list(conn):
             rows = await conn.fetch(
                 """
                 SELECT id::text, trial_id::text, strategy_id::text, symbol, side,
@@ -103,6 +105,8 @@ class TradeRepository(AsyncPostgresRepository):
                 as_uuid(trial_id),
                 int(limit),
             )
+            return rows
+        rows = await self._run_with_retry(_list, context="list_by_trial")
         return [dict(row) for row in rows]
 
     @classmethod

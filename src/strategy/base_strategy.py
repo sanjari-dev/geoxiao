@@ -13,7 +13,7 @@ class StrategyDNA:
     """
     Data Transfer Object untuk representasi genetik strategi.
     Digunakan sebagai antarmuka antara GP Generator, Optuna Tuner,
-    NautilusTrader Adapter, dan PostgreSQL Repository.
+    ClickHouse Evaluator, dan PostgreSQL Repository.
     """
     id: str = field(default=None)
     generation: int = 0
@@ -94,6 +94,15 @@ class BaseStrategy(ABC):
             None: tidak ada signal
         """
         ...
+
+    def compute_signal_value(self, features: Any) -> float:
+        """
+        Return scalar signal sebelum dikonversi menjadi keputusan BUY/SELL/HOLD.
+
+        Default implementation sengaja melempar agar subclass eksplisit
+        menyediakan signal numeriknya jika dibutuhkan untuk diagnostics.
+        """
+        raise NotImplementedError("Strategy subclass must implement compute_signal_value()")
 
     @abstractmethod
     def validate_params(self) -> bool:
