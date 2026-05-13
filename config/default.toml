@@ -1,0 +1,3 @@
+clickhouse_url = "http://localhost:8123"
+postgres_url = "postgres://postgres:postgres@localhost:5432/esse"
+dashboard_port = 3000

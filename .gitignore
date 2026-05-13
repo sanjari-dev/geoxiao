@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE files
+.idea/*
+!.idea/runConfigurations/
+!.idea/runConfigurations/*.xml
+!.idea/vcs.xml
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.log
